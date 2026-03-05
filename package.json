@@ -1,0 +1,21 @@
+{
+  "name": "fbauto",
+  "module": "index.ts",
+  "scripts": {
+    "start": "bun run index.ts",
+    "dev": "bun --hot index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "googleapis": "^171.4.0",
+    "openai": "^6.26.0",
+    "sharp": "^0.34.5"
+  }
+}
