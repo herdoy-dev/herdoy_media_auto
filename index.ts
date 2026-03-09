@@ -1,6 +1,17 @@
 import sharp from "sharp";
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
+// Load API keys from key-list.json and rotate them round-robin
+const keyList = await Bun.file("key-list.json").json() as { keys: string[] };
+const GEMINI_KEYS = keyList.keys;
+let currentKeyIndex = 0;
+
+function getNextGeminiKey(): string {
+  const key = GEMINI_KEYS[currentKeyIndex]!;
+  currentKeyIndex = (currentKeyIndex + 1) % GEMINI_KEYS.length;
+  console.log(`[Key] Using API key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} of ${GEMINI_KEYS.length}`);
+  return key;
+}
+
 const FACEBOOK_TOKEN = process.env.FACEBOOK_GRAPH_API!;
 const FACEBOOK_PAGE_ID = process.env.FACEBOOK_PAGE_ID!;
 const PORT = Number(process.env.PORT) || 8000;
@@ -9,45 +20,100 @@ const POST_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 const GEMINI_TEXT_MODEL = "gemini-2.0-flash";
 const GEMINI_IMAGE_MODEL = "gemini-2.0-flash-exp-image-generation";
 
+const RETRY_DELAY_MS = 30_000; // 30 seconds
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function geminiGenerateText(systemPrompt: string, userPrompt: string, maxTokens: number = 500): Promise<string> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-        generationConfig: { maxOutputTokens: maxTokens },
-      }),
-    },
-  );
-  const data = (await res.json()) as any;
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-  if (!text) throw new Error(`No content returned from Gemini: ${JSON.stringify(data)}`);
-  return text;
+  while (true) {
+    for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
+      const apiKey = getNextGeminiKey();
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: systemPrompt }] },
+              contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+              generationConfig: { maxOutputTokens: maxTokens },
+            }),
+          },
+        );
+        const data = (await res.json()) as any;
+        if (res.status === 429 || data?.error?.status === "RESOURCE_EXHAUSTED") {
+          console.warn(`[Key] Key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} quota exhausted, trying next key...`);
+          continue;
+        }
+        if (data?.error) {
+          console.warn(`[Gemini] Error: ${data.error.message}, trying next key...`);
+          continue;
+        }
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (!text) {
+          console.warn(`[Gemini] No content in response, trying next key...`);
+          continue;
+        }
+        return text;
+      } catch (err: any) {
+        console.warn(`[Gemini] Request failed: ${err.message}, trying next key...`);
+        continue;
+      }
+    }
+    console.log(`[Retry] All keys failed. Retrying in 30 seconds...`);
+    await sleep(RETRY_DELAY_MS);
+  }
 }
 
 async function geminiGenerateImage(prompt: string): Promise<Buffer> {
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          responseModalities: ["IMAGE", "TEXT"],
-        },
-      }),
-    },
-  );
-  const data = (await res.json()) as any;
-  const parts = data?.candidates?.[0]?.content?.parts;
-  if (!parts) throw new Error(`No image returned from Gemini: ${JSON.stringify(data)}`);
-  const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith("image/"));
-  if (!imagePart) throw new Error(`No image part in Gemini response`);
-  return Buffer.from(imagePart.inlineData.data, "base64");
+  while (true) {
+    for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
+      const apiKey = getNextGeminiKey();
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${apiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: prompt }] }],
+              generationConfig: {
+                responseModalities: ["IMAGE", "TEXT"],
+              },
+            }),
+          },
+        );
+        const data = (await res.json()) as any;
+        if (res.status === 429 || data?.error?.status === "RESOURCE_EXHAUSTED") {
+          console.warn(`[Key] Key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} quota exhausted, trying next key...`);
+          continue;
+        }
+        if (data?.error) {
+          console.warn(`[Gemini] Error: ${data.error.message}, trying next key...`);
+          continue;
+        }
+        const parts = data?.candidates?.[0]?.content?.parts;
+        if (!parts) {
+          console.warn(`[Gemini] No image in response, trying next key...`);
+          continue;
+        }
+        const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith("image/"));
+        if (!imagePart) {
+          console.warn(`[Gemini] No image part in response, trying next key...`);
+          continue;
+        }
+        return Buffer.from(imagePart.inlineData.data, "base64");
+      } catch (err: any) {
+        console.warn(`[Gemini] Request failed: ${err.message}, trying next key...`);
+        continue;
+      }
+    }
+    console.log(`[Retry] All keys failed. Retrying in 30 seconds...`);
+    await sleep(RETRY_DELAY_MS);
+  }
 }
 
 let postCount = 0;
@@ -61,11 +127,23 @@ interface TrendingTopic {
   approximateTraffic: string;
 }
 
+// Google Trends category IDs for diverse content
+const TREND_CATEGORIES = [
+  { id: "", label: "All" },
+  { id: "&cat=e", label: "Entertainment" },
+  { id: "&cat=b", label: "Business" },
+  { id: "&cat=t", label: "Sci/Tech" },
+  { id: "&cat=h", label: "Health" },
+];
+let currentCategoryIndex = 0;
+
 async function fetchTrendingTopics(): Promise<TrendingTopic[]> {
-  console.log(`[Trends] Fetching trending topics from Google Trends...`);
+  const category = TREND_CATEGORIES[currentCategoryIndex]!;
+  currentCategoryIndex = (currentCategoryIndex + 1) % TREND_CATEGORIES.length;
+  console.log(`[Trends] Fetching trending topics (${category.label})...`);
 
   const res = await fetch(
-    "https://trends.google.com/trending/rss?geo=US",
+    `https://trends.google.com/trending/rss?geo=US${category.id}`,
     {
       headers: {
         "User-Agent":
@@ -413,6 +491,8 @@ Bun.serve({
           nextPostIn: `${Math.round(POST_INTERVAL_MS / 60000)} minutes`,
           isCurrentlyPosting: isPosting,
           postedTopics: [...postedTopics],
+          apiKeyRotation: { current: currentKeyIndex + 1, total: GEMINI_KEYS.length },
+          nextCategory: TREND_CATEGORIES[currentCategoryIndex]?.label,
         });
       },
     },
