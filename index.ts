@@ -1,24 +1,54 @@
-import OpenAI from "openai";
 import sharp from "sharp";
-import { google } from "googleapis";
-import serviceAccount from "./meta-auto-489319-bf4f8f5a902c.json";
 
-const SPREADSHEET_ID = "1RSAVO4AHtkwnEeZIRRGClnNIiB-BHzm9i9GxCc2Fv8E";
-
-const sheetsAuth = new google.auth.JWT({
-  email: serviceAccount.client_email,
-  key: serviceAccount.private_key,
-  scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-});
-const sheets = google.sheets({ version: "v4", auth: sheetsAuth });
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
-const FACEBOOK_TOKEN = process.env.FACEBOOK_GRAPH_API_KEY!;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY!;
+const FACEBOOK_TOKEN = process.env.FACEBOOK_GRAPH_API!;
 const FACEBOOK_PAGE_ID = process.env.FACEBOOK_PAGE_ID!;
 const PORT = Number(process.env.PORT) || 8000;
 const POST_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const GEMINI_TEXT_MODEL = "gemini-2.0-flash";
+const GEMINI_IMAGE_MODEL = "gemini-2.0-flash-exp-image-generation";
+
+async function geminiGenerateText(systemPrompt: string, userPrompt: string, maxTokens: number = 500): Promise<string> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: systemPrompt }] },
+        contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+        generationConfig: { maxOutputTokens: maxTokens },
+      }),
+    },
+  );
+  const data = (await res.json()) as any;
+  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+  if (!text) throw new Error(`No content returned from Gemini: ${JSON.stringify(data)}`);
+  return text;
+}
+
+async function geminiGenerateImage(prompt: string): Promise<Buffer> {
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseModalities: ["IMAGE", "TEXT"],
+        },
+      }),
+    },
+  );
+  const data = (await res.json()) as any;
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!parts) throw new Error(`No image returned from Gemini: ${JSON.stringify(data)}`);
+  const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith("image/"));
+  if (!imagePart) throw new Error(`No image part in Gemini response`);
+  return Buffer.from(imagePart.inlineData.data, "base64");
+}
 
 let postCount = 0;
 let lastPostTime: string | null = null;
@@ -115,16 +145,10 @@ async function generateHeadline(topic: TrendingTopic): Promise<string> {
     .map((n) => `- ${n.title} (${n.source})`)
     .join("\n");
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content: "You write short, punchy news headlines for thumbnail images. Return ONLY the headline text, nothing else.",
-      },
-      {
-        role: "user",
-        content: `Write a short, impactful news headline (max 8 words) for a thumbnail image about this trending topic:
+  try {
+    const text = await geminiGenerateText(
+      "You write short, punchy news headlines for thumbnail images. Return ONLY the headline text, nothing else.",
+      `Write a short, impactful news headline (max 8 words) for a thumbnail image about this trending topic:
 
 Topic: ${topic.title}
 Related: ${newsContext || "N/A"}
@@ -135,34 +159,22 @@ Rules:
 - Punchy and attention-grabbing
 - No quotes, no hashtags, no punctuation except ? or !
 - Return ONLY the headline`,
-      },
-    ],
-    max_tokens: 50,
-  });
-
-  return response.choices[0]?.message?.content?.trim() || topic.title.toUpperCase();
+      50,
+    );
+    return text;
+  } catch {
+    return topic.title.toUpperCase();
+  }
 }
 
 async function generateNewsImage(topic: TrendingTopic, headline: string): Promise<Buffer> {
   console.log(`[Image] Generating news background for: "${topic.title}"`);
 
-  // Generate a cinematic background image related to the topic
-  const response = await openai.images.generate({
-    model: "dall-e-3",
-    prompt: `Professional cinematic news photograph related to "${topic.title}". Dramatic lighting, photojournalism style, no text, no words, no letters, no watermarks. Wide shot, high quality, editorial photography style, moody atmosphere, suitable as a news broadcast background.`,
-    n: 1,
-    size: "1792x1024",
-    quality: "hd",
-    style: "natural",
-  });
-
-  const imageUrl = response.data?.[0]?.url;
-  if (!imageUrl) throw new Error("No image URL returned from DALL-E");
-
-  // Download the generated background
-  console.log(`[Image] Downloading background...`);
-  const imageRes = await fetch(imageUrl);
-  const bgBuffer = Buffer.from(await imageRes.arrayBuffer());
+  // Generate a cinematic background image related to the topic using Gemini
+  const bgBuffer = await geminiGenerateImage(
+    `Professional cinematic news photograph related to "${topic.title}". Dramatic lighting, photojournalism style, no text, no words, no letters, no watermarks. Wide shot, high quality, editorial photography style, moody atmosphere, suitable as a news broadcast background.`,
+  );
+  console.log(`[Image] Background generated (${(bgBuffer.length / 1024).toFixed(0)} KB)`);
 
   // Create the news thumbnail overlay with SVG
   console.log(`[Image] Compositing headline overlay...`);
@@ -245,17 +257,9 @@ async function generateNewsPost(topic: TrendingTopic): Promise<string> {
     .map((n) => `- ${n.title} (${n.source})`)
     .join("\n");
 
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are a news Facebook page content creator. Write engaging, informative posts about trending topics.",
-      },
-      {
-        role: "user",
-        content: `Write an engaging Facebook post about this trending topic.
+  const text = await geminiGenerateText(
+    "You are a news Facebook page content creator. Write engaging, informative posts about trending topics.",
+    `Write an engaging Facebook post about this trending topic.
 
 Trending Topic: ${topic.title}
 Approximate Search Traffic: ${topic.approximateTraffic}
@@ -272,13 +276,8 @@ Rules:
 - Do NOT include any URLs
 - Write in a professional but approachable tone
 - Start with a strong hook to grab attention`,
-      },
-    ],
-    max_tokens: 500,
-  });
-
-  const text = response.choices[0]?.message?.content?.trim();
-  if (!text) throw new Error("No content returned from OpenAI");
+    500,
+  );
   return text;
 }
 
@@ -326,18 +325,6 @@ async function postToFacebook(
     throw new Error(`Facebook post error: ${data.error.message}`);
   }
   return data;
-}
-
-async function saveToSheet(postId: string, topic: string, caption: string) {
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SPREADSHEET_ID,
-    range: "Sheet1!A:D",
-    valueInputOption: "USER_ENTERED",
-    requestBody: {
-      values: [[postId, topic, caption, new Date().toISOString()]],
-    },
-  });
-  console.log(`[Sheet] Post saved to Google Sheet`);
 }
 
 async function createAndPublishPost() {
@@ -391,8 +378,6 @@ async function createAndPublishPost() {
     const postId = result.post_id || result.id;
     console.log(`[Success] Post published! Post ID: ${postId}`);
     console.log(`[Stats] Total posts: ${postCount}`);
-
-    await saveToSheet(postId, topic.title, caption);
 
     console.log(`[Next] Next post in 30 minutes`);
     console.log(`${"=".repeat(50)}\n`);
