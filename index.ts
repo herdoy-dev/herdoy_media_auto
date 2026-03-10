@@ -1,118 +1,122 @@
 import sharp from "sharp";
 
-// Load API keys from key-list.json and rotate them round-robin
-const keyList = await Bun.file("key-list.json").json() as { keys: string[] };
-const GEMINI_KEYS = keyList.keys;
-let currentKeyIndex = 0;
-
-function getNextGeminiKey(): string {
-  const key = GEMINI_KEYS[currentKeyIndex]!;
-  currentKeyIndex = (currentKeyIndex + 1) % GEMINI_KEYS.length;
-  console.log(`[Key] Using API key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} of ${GEMINI_KEYS.length}`);
-  return key;
-}
-
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY!;
+const PEXELS_API_KEY = process.env.PIXELS_API_KEY!;
 const FACEBOOK_TOKEN = process.env.FACEBOOK_GRAPH_API!;
 const FACEBOOK_PAGE_ID = process.env.FACEBOOK_PAGE_ID!;
 const PORT = Number(process.env.PORT) || 8000;
 const POST_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
 
-const GEMINI_TEXT_MODEL = "gemini-2.0-flash";
-const GEMINI_IMAGE_MODEL = "gemini-2.0-flash-exp-image-generation";
-
+const OPENAI_MODEL = "gpt-4o-mini";
 const RETRY_DELAY_MS = 30_000; // 30 seconds
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function geminiGenerateText(systemPrompt: string, userPrompt: string, maxTokens: number = 500): Promise<string> {
+async function openaiGenerateText(systemPrompt: string, userPrompt: string, maxTokens: number = 500): Promise<string> {
   while (true) {
-    for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
-      const apiKey = getNextGeminiKey();
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_TEXT_MODEL}:generateContent?key=${apiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: systemPrompt }] },
-              contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-              generationConfig: { maxOutputTokens: maxTokens },
-            }),
-          },
-        );
-        const data = (await res.json()) as any;
-        if (res.status === 429 || data?.error?.status === "RESOURCE_EXHAUSTED") {
-          console.warn(`[Key] Key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} quota exhausted, trying next key...`);
-          continue;
-        }
-        if (data?.error) {
-          console.warn(`[Gemini] Error: ${data.error.message}, trying next key...`);
-          continue;
-        }
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (!text) {
-          console.warn(`[Gemini] No content in response, trying next key...`);
-          continue;
-        }
-        return text;
-      } catch (err: any) {
-        console.warn(`[Gemini] Request failed: ${err.message}, trying next key...`);
+    try {
+      const res = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt },
+          ],
+          max_tokens: maxTokens,
+        }),
+      });
+      const data = (await res.json()) as any;
+      if (res.status === 429) {
+        console.warn(`[OpenAI] Rate limited, retrying in 30 seconds...`);
+        await sleep(RETRY_DELAY_MS);
         continue;
       }
+      if (data?.error) {
+        console.warn(`[OpenAI] Error: ${data.error.message}`);
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      const text = data?.choices?.[0]?.message?.content?.trim();
+      if (!text) {
+        console.warn(`[OpenAI] No content in response, retrying...`);
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      return text;
+    } catch (err: any) {
+      console.warn(`[OpenAI] Request failed: ${err.message}, retrying in 30 seconds...`);
+      await sleep(RETRY_DELAY_MS);
     }
-    console.log(`[Retry] All keys failed. Retrying in 30 seconds...`);
-    await sleep(RETRY_DELAY_MS);
   }
 }
 
-async function geminiGenerateImage(prompt: string): Promise<Buffer> {
+async function pexelsSearchImage(query: string): Promise<Buffer> {
   while (true) {
-    for (let attempt = 0; attempt < GEMINI_KEYS.length; attempt++) {
-      const apiKey = getNextGeminiKey();
-      try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_IMAGE_MODEL}:generateContent?key=${apiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts: [{ text: prompt }] }],
-              generationConfig: {
-                responseModalities: ["IMAGE", "TEXT"],
-              },
-            }),
+    try {
+      const res = await fetch(
+        `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=15&orientation=landscape`,
+        {
+          headers: {
+            "Authorization": PEXELS_API_KEY,
           },
-        );
-        const data = (await res.json()) as any;
-        if (res.status === 429 || data?.error?.status === "RESOURCE_EXHAUSTED") {
-          console.warn(`[Key] Key #${currentKeyIndex === 0 ? GEMINI_KEYS.length : currentKeyIndex} quota exhausted, trying next key...`);
-          continue;
-        }
-        if (data?.error) {
-          console.warn(`[Gemini] Error: ${data.error.message}, trying next key...`);
-          continue;
-        }
-        const parts = data?.candidates?.[0]?.content?.parts;
-        if (!parts) {
-          console.warn(`[Gemini] No image in response, trying next key...`);
-          continue;
-        }
-        const imagePart = parts.find((p: any) => p.inlineData?.mimeType?.startsWith("image/"));
-        if (!imagePart) {
-          console.warn(`[Gemini] No image part in response, trying next key...`);
-          continue;
-        }
-        return Buffer.from(imagePart.inlineData.data, "base64");
-      } catch (err: any) {
-        console.warn(`[Gemini] Request failed: ${err.message}, trying next key...`);
+        },
+      );
+      const data = (await res.json()) as any;
+      if (res.status === 429) {
+        console.warn(`[Pexels] Rate limited, retrying in 30 seconds...`);
+        await sleep(RETRY_DELAY_MS);
         continue;
       }
+      if (!data?.photos?.length) {
+        console.warn(`[Pexels] No photos found for "${query}", trying broader search...`);
+        // Try a broader search with just the first word
+        const broader = query.split(" ").slice(0, 2).join(" ");
+        if (broader !== query) {
+          const res2 = await fetch(
+            `https://api.pexels.com/v1/search?query=${encodeURIComponent(broader)}&per_page=15&orientation=landscape`,
+            { headers: { "Authorization": PEXELS_API_KEY } },
+          );
+          const data2 = (await res2.json()) as any;
+          if (data2?.photos?.length) {
+            const photo = data2.photos[Math.floor(Math.random() * data2.photos.length)];
+            const imageUrl = photo.src.large2x || photo.src.large || photo.src.original;
+            const imgRes = await fetch(imageUrl);
+            return Buffer.from(await imgRes.arrayBuffer());
+          }
+        }
+        // Fallback to "news" search
+        const fallbackRes = await fetch(
+          `https://api.pexels.com/v1/search?query=news+breaking&per_page=10&orientation=landscape`,
+          { headers: { "Authorization": PEXELS_API_KEY } },
+        );
+        const fallbackData = (await fallbackRes.json()) as any;
+        if (fallbackData?.photos?.length) {
+          const photo = fallbackData.photos[Math.floor(Math.random() * fallbackData.photos.length)];
+          const imageUrl = photo.src.large2x || photo.src.large || photo.src.original;
+          const imgRes = await fetch(imageUrl);
+          return Buffer.from(await imgRes.arrayBuffer());
+        }
+        console.warn(`[Pexels] Still no photos found, retrying in 30 seconds...`);
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      // Pick a random photo from results for variety
+      const photo = data.photos[Math.floor(Math.random() * data.photos.length)];
+      const imageUrl = photo.src.large2x || photo.src.large || photo.src.original;
+      console.log(`[Pexels] Found photo by ${photo.photographer}: ${imageUrl}`);
+      const imgRes = await fetch(imageUrl);
+      return Buffer.from(await imgRes.arrayBuffer());
+    } catch (err: any) {
+      console.warn(`[Pexels] Request failed: ${err.message}, retrying in 30 seconds...`);
+      await sleep(RETRY_DELAY_MS);
     }
-    console.log(`[Retry] All keys failed. Retrying in 30 seconds...`);
-    await sleep(RETRY_DELAY_MS);
   }
 }
 
@@ -224,7 +228,7 @@ async function generateHeadline(topic: TrendingTopic): Promise<string> {
     .join("\n");
 
   try {
-    const text = await geminiGenerateText(
+    const text = await openaiGenerateText(
       "You write short, punchy news headlines for thumbnail images. Return ONLY the headline text, nothing else.",
       `Write a short, impactful news headline (max 8 words) for a thumbnail image about this trending topic:
 
@@ -245,14 +249,28 @@ Rules:
   }
 }
 
-async function generateNewsImage(topic: TrendingTopic, headline: string): Promise<Buffer> {
-  console.log(`[Image] Generating news background for: "${topic.title}"`);
+async function generateImageSearchQuery(topic: TrendingTopic): Promise<string> {
+  try {
+    const text = await openaiGenerateText(
+      "You generate short search queries for stock photo websites. Return ONLY the search query, nothing else.",
+      `Generate a 2-4 word search query to find a relevant stock photo for this news topic: "${topic.title}".
+Return ONLY the search query, no quotes, no explanation.`,
+      20,
+    );
+    return text.replace(/["']/g, "").trim();
+  } catch {
+    return topic.title;
+  }
+}
 
-  // Generate a cinematic background image related to the topic using Gemini
-  const bgBuffer = await geminiGenerateImage(
-    `Professional cinematic news photograph related to "${topic.title}". Dramatic lighting, photojournalism style, no text, no words, no letters, no watermarks. Wide shot, high quality, editorial photography style, moody atmosphere, suitable as a news broadcast background.`,
-  );
-  console.log(`[Image] Background generated (${(bgBuffer.length / 1024).toFixed(0)} KB)`);
+async function generateNewsImage(topic: TrendingTopic, headline: string): Promise<Buffer> {
+  console.log(`[Image] Searching for news background for: "${topic.title}"`);
+
+  // Generate a search query and fetch a photo from Pexels
+  const searchQuery = await generateImageSearchQuery(topic);
+  console.log(`[Image] Pexels search query: "${searchQuery}"`);
+  const bgBuffer = await pexelsSearchImage(searchQuery);
+  console.log(`[Image] Background fetched (${(bgBuffer.length / 1024).toFixed(0)} KB)`);
 
   // Create the news thumbnail overlay with SVG
   console.log(`[Image] Compositing headline overlay...`);
@@ -335,7 +353,7 @@ async function generateNewsPost(topic: TrendingTopic): Promise<string> {
     .map((n) => `- ${n.title} (${n.source})`)
     .join("\n");
 
-  const text = await geminiGenerateText(
+  const text = await openaiGenerateText(
     "You are a news Facebook page content creator. Write engaging, informative posts about trending topics.",
     `Write an engaging Facebook post about this trending topic.
 
@@ -430,7 +448,7 @@ async function createAndPublishPost() {
       `[Topic] "${topic.title}" (${topic.approximateTraffic} searches)`,
     );
 
-    // Generate headline, caption, image, and get page token in parallel
+    // Generate headline, caption, and get page token in parallel
     const [headline, caption, pageAccessToken] = await Promise.all([
       generateHeadline(topic),
       generateNewsPost(topic),
@@ -491,7 +509,8 @@ Bun.serve({
           nextPostIn: `${Math.round(POST_INTERVAL_MS / 60000)} minutes`,
           isCurrentlyPosting: isPosting,
           postedTopics: [...postedTopics],
-          apiKeyRotation: { current: currentKeyIndex + 1, total: GEMINI_KEYS.length },
+          textModel: OPENAI_MODEL,
+          imageSource: "Pexels",
           nextCategory: TREND_CATEGORIES[currentCategoryIndex]?.label,
         });
       },
