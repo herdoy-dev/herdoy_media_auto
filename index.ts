@@ -384,8 +384,9 @@ async function getPageAccessToken(): Promise<string> {
   const data = (await res.json()) as any;
 
   if (data.error) {
-    console.warn(`[Page] Could not get page token: ${data.error.message}`);
-    console.log(`[Page] Using provided token directly`);
+    console.warn(`[Page] WARNING: Could not get page token: ${data.error.message}`);
+    console.warn(`[Page] WARNING: Using user token as fallback - posts may have limited visibility!`);
+    console.warn(`[Page] Make sure your token has pages_manage_posts and pages_read_engagement permissions`);
     return FACEBOOK_TOKEN;
   }
 
@@ -394,6 +395,7 @@ async function getPageAccessToken(): Promise<string> {
     return data.access_token;
   }
 
+  console.warn(`[Page] WARNING: No page access token in response, using fallback`);
   return FACEBOOK_TOKEN;
 }
 
@@ -404,23 +406,43 @@ async function postToFacebook(
   caption: string,
 ): Promise<any> {
   console.log(`[Upload] Uploading image to Facebook...`);
-  const formData = new FormData();
-  formData.append(
+
+  // Step 1: Upload image as unpublished to get a photo ID
+  const uploadForm = new FormData();
+  uploadForm.append(
     "source",
     new File([imageBuffer], "news.jpg", { type: "image/jpeg" }),
   );
-  formData.append("message", caption);
-  formData.append("access_token", pageAccessToken);
+  uploadForm.append("published", "false");
+  uploadForm.append("access_token", pageAccessToken);
 
-  const res = await fetch(`https://graph.facebook.com/v22.0/${pageId}/photos`, {
+  const uploadRes = await fetch(`https://graph.facebook.com/v22.0/${pageId}/photos`, {
     method: "POST",
-    body: formData,
+    body: uploadForm,
   });
-  const data = (await res.json()) as any;
-  if (data.error) {
-    throw new Error(`Facebook post error: ${data.error.message}`);
+  const uploadData = (await uploadRes.json()) as any;
+  if (uploadData.error) {
+    throw new Error(`Facebook upload error: ${uploadData.error.message}`);
   }
-  return data;
+  const photoId = uploadData.id;
+  console.log(`[Upload] Photo uploaded (ID: ${photoId}), creating feed post...`);
+
+  // Step 2: Create a feed post with the uploaded photo attached
+  const postForm = new FormData();
+  postForm.append("message", caption);
+  postForm.append("attached_media[0]", JSON.stringify({ media_fbid: photoId }));
+  postForm.append("published", "true");
+  postForm.append("access_token", pageAccessToken);
+
+  const postRes = await fetch(`https://graph.facebook.com/v22.0/${pageId}/feed`, {
+    method: "POST",
+    body: postForm,
+  });
+  const postData = (await postRes.json()) as any;
+  if (postData.error) {
+    throw new Error(`Facebook post error: ${postData.error.message}`);
+  }
+  return postData;
 }
 
 async function createAndPublishPost() {
